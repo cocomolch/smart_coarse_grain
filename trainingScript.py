@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image
 import argparse
 from torch.utils.data import Subset
+import math
 import csv
 
 class PairedImageDataset(Dataset):
@@ -61,7 +62,7 @@ class upscaleModel(nn.Module):
         self.dropout = nn.Dropout(0.1)
     def forward(self, x):
         x = F.tanh(self.conv1(x))
-        #x = F.tanh(self.convPablo(x))
+        x = F.tanh(self.convPablo(x))
         #x = F.tanh(self.convPablo(x))
         #x = self.dropout(x)
         #x = F.tanh(self.convPablo(x))
@@ -107,11 +108,13 @@ def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
         for i, (input, target) in enumerate(trainingLoader):
             
             #into gpu
-            input, target = input.to(device), target.to(device)
+            input, target = (input.to(device)/math.pi), (target.to(device)/math.pi)
             #forward pass
             #print(f'so many nan in train befor forward{torch.isnan(input).sum()/torch.numel(input)}')
             if not torch.isnan(input).any():
-                forwardOut = model(input)#arget[::2, ::2]
+                #print(target.shape)
+                
+                forwardOut = model(input) #normalize to 0 1
                 #print(f'so many nan in train {torch.isnan(forwardOut).sum()/torch.numel(forwardOut)}')
                 if int(torch.isnan(forwardOut).sum().item()) < (forwardOut.numel()*0.05) and int(torch.isnan(target).sum().item()) < (target.numel()*0.05):
                     #set NaN to zero
@@ -144,7 +147,7 @@ def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
         model.eval()
         with torch.no_grad():
             for input, target in validationLoader:
-                input, target = input.to(device), target.to(device)
+                input, target = (input.to(device)/math.pi), (target.to(device)/math.pi)
                 forwardOut = model(input)
                 if int(torch.isnan(forwardOut).sum().item()) < (forwardOut.numel()*0.05) and int(torch.isnan(target).sum().item()) < (target.numel()*0.05):
                     #set NaN to zero
