@@ -3,7 +3,7 @@ set -e
 
 # Hyperparameter grids
 
-lrs=(0.01 0.005 0.001 0.0005)
+lrs=(0.001 0.0001)
 acc_sizes=(1)
 
 # Loop over all combinations
@@ -12,10 +12,10 @@ for lr in "${lrs[@]}"; do
         echo "Running LR=$lr, Acc_Size=$acc_size"
         
         python trainingScript.py \
-            --log_csv "c1c2Shc3_logging.csv" \
-            --num_epoch 400 \
+            --log_csv "c1c2Shc3_upscale8_logging.csv" \
+            --num_epoch 100 \
             --acc_size $acc_size \
             --lr $lr \
-            --upscale_factor 2
+            --upscale_factor 8
     done
 done

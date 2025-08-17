@@ -14,6 +14,7 @@ import argparse
 from torch.utils.data import Subset
 import math
 import csv
+import os
 
 class PairedImageDataset(Dataset):
     def __init__(self, input_dir, target_dir, transform=None):
@@ -37,6 +38,7 @@ class PairedImageDataset(Dataset):
 
         return input_img, target_img
 
+#TRY RESIDUAL BLOCKS AT SOME TIME
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super(ResidualBlock, self).__init__()
@@ -62,7 +64,7 @@ class upscaleModel(nn.Module):
         self.dropout = nn.Dropout(0.1)
     def forward(self, x):
         x = F.tanh(self.conv1(x))
-        x = F.tanh(self.convPablo(x))
+        #x = F.tanh(self.convPablo(x))
         #x = F.tanh(self.convPablo(x))
         #x = self.dropout(x)
         #x = F.tanh(self.convPablo(x))
@@ -80,11 +82,11 @@ def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
 
 
     trainingData = PairedImageDataset(input_dir=r"O:/Data upscale train/Dataset/train/input/_upscaleFactor"+str(upscale_factor)+"/", target_dir=r"O:/Data upscale train/Dataset/train/target/_upscaleFactor"+str(upscale_factor)+"/", transform=currentTransforms)
-    trainingData = Subset(trainingData, range(300))
+    trainingData = Subset(trainingData, range(500))
     trainingLoader = DataLoader(trainingData, batch_size=1, shuffle=True)
 
     validationData = PairedImageDataset(input_dir=r"O:/Data upscale train/Dataset/validate/input/_upscaleFactor"+str(upscale_factor)+"/", target_dir=r"O:/Data upscale train/Dataset/validate/target/_upscaleFactor"+str(upscale_factor)+"/", transform=currentTransforms)
-    validationLoader = DataLoader(validationData, batch_size=1, shuffle=False)
+    validationLoader = DataLoader(validationData, batch_size=1, shuffle=True)
 
     # gpu
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -167,16 +169,18 @@ def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
         validation_loss.append(run_loss_val/len(validationLoader))
         scheduler.step()
         print(f"Epoch {epoch+1}/{num_epoch}, Train Loss: {train_loss[epoch]}, Val Loss: {validation_loss[epoch]}")
-
-        saveIntoCSV(log_csv, train_loss[epoch], validation_loss[epoch], lr, acc_size, upscale_factor, num_epoch)
+    saveIntoCSV(log_csv, train_loss[epoch], validation_loss[epoch], lr, acc_size, upscale_factor, num_epoch)
 
 
 def saveIntoCSV(log_csv, train_loss, validation_loss, lr, acc_size, upscale_factor, num_epoch):
     with open(log_csv, mode='a', newline='') as f:
         writer = csv.writer(f)
-        # write header
-        writer.writerow([ "train_loss", "val_loss", "lr", "acc_size", "upscale_factor", "num_epochs"])
-        writer.writerow([ train_loss, validation_loss, lr, acc_size, upscale_factor, num_epoch])
+        if not os.path.exists(log_csv):
+            # write header
+            writer.writerow([ "train_loss", "val_loss", "lr", "acc_size", "upscale_factor", "num_epochs"])
+            writer.writerow([ train_loss, validation_loss, lr, acc_size, upscale_factor, num_epoch])
+        else:
+            writer.writerow([ train_loss, validation_loss, lr, acc_size, upscale_factor, num_epoch])
 
 if __name__ == "__main__":
         parser = argparse.ArgumentParser(description="Train an image upscaling model")

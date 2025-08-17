@@ -1,2 +1,0 @@
-train_loss,val_loss,lr,acc_size,upscale_factor,num_epochs
-0.15524502815944807,0.15744165911394006,0.005,1,2,100
