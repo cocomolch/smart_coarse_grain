@@ -15,6 +15,7 @@ from torch.utils.data import Subset
 import math
 import csv
 import os
+import numpy as np
 
 class PairedImageDataset(Dataset):
     def __init__(self, input_dir, target_dir, transform=None):
@@ -70,10 +71,15 @@ class upscaleModel(nn.Module):
         #x = F.tanh(self.convPablo(x))
         x = F.tanh(self.conv2(x))
         x = self.pixel_shuffle(self.conv3(x))
-        x = torch.sigmoid(x)
+        #x = torch.sigmoid(x)
         #x = torch.clamp(x, 0, 1)  # Ensure output is in [0, 1] range
         return x
 
+
+def psnr_from_mse(mse, max_val = 1.0):
+    if mse == 0:
+        return np.nan
+    return 10 * np.log10(max_val**2 / mse)
 
 def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
 
@@ -82,7 +88,7 @@ def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
 
 
     trainingData = PairedImageDataset(input_dir=r"O:/Data upscale train/Dataset/train/input/_upscaleFactor"+str(upscale_factor)+"/", target_dir=r"O:/Data upscale train/Dataset/train/target/_upscaleFactor"+str(upscale_factor)+"/", transform=currentTransforms)
-    trainingData = Subset(trainingData, range(500))
+    trainingData = Subset(trainingData, range(2500))
     trainingLoader = DataLoader(trainingData, batch_size=1, shuffle=True)
 
     validationData = PairedImageDataset(input_dir=r"O:/Data upscale train/Dataset/validate/input/_upscaleFactor"+str(upscale_factor)+"/", target_dir=r"O:/Data upscale train/Dataset/validate/target/_upscaleFactor"+str(upscale_factor)+"/", transform=currentTransforms)
@@ -92,7 +98,7 @@ def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Move your model to the device
     model = upscaleModel(upscale_factor=upscale_factor).to(device)
-    loss = nn.L1Loss() #L1Loss()
+    loss = nn.MSELoss() #L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
     #scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
@@ -168,7 +174,7 @@ def train(log_csv, num_epoch,acc_size,lr, upscale_factor):
                     run_loss_val += MSE.item()
         validation_loss.append(run_loss_val/len(validationLoader))
         scheduler.step()
-        print(f"Epoch {epoch+1}/{num_epoch}, Train Loss: {train_loss[epoch]}, Val Loss: {validation_loss[epoch]}")
+        print(f"Epoch {epoch+1}/{num_epoch}, Train Loss: {np.sqrt(train_loss[epoch])}, Val Loss: {np.sqrt(validation_loss[epoch])}, PSNR: {psnr_from_mse(validation_loss[epoch])}")
     saveIntoCSV(log_csv, train_loss[epoch], validation_loss[epoch], lr, acc_size, upscale_factor, num_epoch)
 
 
