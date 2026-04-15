@@ -6,6 +6,36 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 
+
+"""
+Original code in Matlab by Pablo Gottheil, Universität Leipzig (https://github.com/pgotth/Cancer-Nematics.git)
+"""
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from skimage.filters import sobel
+import matplotlib.pyplot as plt
+from skimage.morphology import disk
+from scipy.signal import convolve2d
+from skimage.morphology import thin
+import torch as th
+## 2D Q Tensor
+def get2DQtensor(nx, ny, mum_per_px_2D,  QtensorAverageScale):
+
+
+    Qxx = nx**2 - 0.5
+    Qxy = nx * ny
+    Qxx_cg = gaussian_filter(Qxx, sigma=QtensorAverageScale / mum_per_px_2D)
+    Qxy_cg = gaussian_filter(Qxy, sigma=QtensorAverageScale / mum_per_px_2D)
+    S = 2 * np.sqrt(Qxx_cg**2 + Qxy_cg**2)  # nematic order parameter
+    Qxx = Qxx_cg / S
+    Qxy = Qxy_cg / S
+    nx_cg = np.sqrt(Qxx + 0.5)
+    ny_cg = np.sqrt(1 - nx_cg**2) * np.sign(Qxy)
+
+    return S, nx_cg, ny_cg
+
+
+
 def cart2pol(x, y):
     rho = np.sqrt(x**2 + y**2)
     phi = np.arctan2(y, x)
@@ -135,7 +165,7 @@ def smart_structure_tensor(
     enum = th.sqrt(diff**2 + 4 * Ixy**2)
 
     # smallest eigenvalue
-    lambda2 = tr / 2 - th.sqrt(enum) / 2
+    lambda2 = tr / 2 -  (enum) / 2
     # corresponding eigenvector
     eigenvector2 = th.zeros(Ixx.shape[2], Ixx.shape[3], 2)
     eigenvector2[:, :, 0] = Ixy
@@ -1232,3 +1262,94 @@ def compute_omega_and_beta(
             beta_volume[p[0], p[1], p[2]] = np.arccos(dot)
 
     return omega_volume, beta_volume, skel
+
+
+
+from matplotlib.collections import LineCollection
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plotDirectorAndDefects(
+        rgb_img,
+        windingMap_clean,
+        nx_cg,
+        ny_cg,
+        rod_spacing,
+        mum_per_px,
+        scale_bar_um):
+
+    step = int(rod_spacing)
+
+    # sparse grid
+    ys, xs = np.mgrid[0:rgb_img.shape[0]:step,
+                      0:rgb_img.shape[1]:step]
+
+    U = nx_cg[ys, xs]
+    V = ny_cg[ys, xs]
+
+    # rod length
+    L = step * 0.8
+
+    # --- vectorized rod endpoints ---
+    x0 = xs - L*U/2
+    x1 = xs + L*U/2
+    y0 = ys - L*V/2
+    y1 = ys + L*V/2
+
+    segments = np.stack(
+        [np.stack([x0, y0], axis=-1),
+         np.stack([x1, y1], axis=-1)],
+        axis=2
+    ).reshape(-1,2,2)
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=(8,8))
+    ax.imshow(rgb_img, origin='lower')
+
+    # director rods
+    lc = LineCollection(segments, colors='k', linewidths=1)
+    ax.add_collection(lc)
+
+    # --- defects ---
+    plus  = np.where(windingMap_clean == 0.5)
+    minus = np.where(windingMap_clean == -0.5)
+
+    ax.scatter(plus[1],  plus[0],  c='red',  s=30, label='+1/2')
+    ax.scatter(minus[1], minus[0], c='blue', s=30, label='-1/2')
+
+    # --- scale bar ---
+    # convert µm to pixels
+    bar_px = scale_bar_um / mum_per_px
+
+    # bar position (bottom-left with margin)
+    margin = rgb_img.shape[1] * 0.05
+    x_start = margin
+    y_start = rgb_img.shape[0] * 0.05
+
+    # draw outline (black thicker line)
+    ax.plot([x_start, x_start + bar_px],
+            [y_start, y_start],
+            color='black', lw=5, solid_capstyle='butt')
+
+    # draw white bar on top
+    ax.plot([x_start, x_start + bar_px],
+            [y_start, y_start],
+            color='black', lw=3, solid_capstyle='butt')
+
+    # label
+    ax.text(x_start + bar_px/2,
+            y_start + rgb_img.shape[0]*0.02,
+            f"{scale_bar_um:.0f} µm",
+            color='black',
+            ha='center',
+            va='bottom',
+            fontsize=10,
+            weight='bold')
+
+    ax.legend()
+    ax.set_title("Director field and ±1/2 defects")
+    ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
