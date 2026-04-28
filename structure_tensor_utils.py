@@ -8,8 +8,10 @@ from scipy.ndimage import gaussian_filter
 
 
 """
-Original code in Matlab by Pablo Gottheil, Universität Leipzig (https://github.com/pgotth/Cancer-Nematics.git)
+Original code by Pablo Gottheil, FAU Erlangen-Nürnberg)
 """
+
+
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from skimage.filters import sobel
@@ -178,7 +180,7 @@ def smart_structure_tensor(
     nx = eigenvector2[:, :, 0]
     ny = eigenvector2[:, :, 1]
 
-    theta = th.acos(np.abs(nx))
+    theta = th.acos((nx))
     # theta = th.atan2(ny, nx)
     if method == "inter_area":
         theta_reconstruct = cv.resize(
@@ -206,6 +208,52 @@ def smart_structure_tensor(
         )
     return theta_reconstruct
 
+def smart_structure_tensor_signed(
+    img_tensor,
+    coarseGrainAverage="gaussian",
+    coarseGrainingLength=4,
+    downsample=2,
+):
+    """Like smart_structure_tensor but returns signed (nx, ny) at native resolution."""
+    nativeDimensions = img_tensor.shape[2:]
+
+    if coarseGrainAverage == "gaussian":
+        G = getGaussianKernel(coarseGrainingLength)
+    else:
+        G = th.ones((1, 1, coarseGrainingLength, coarseGrainingLength)) / coarseGrainingLength**2
+        G = G.float()
+
+    G_small = getGaussianKernel(1)
+    img_tensor = th.conv2d(img_tensor, G_small, padding="same")
+
+    sobel_x = th.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=th.float32).view(1,1,3,3)
+    sobel_y = th.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=th.float32).view(1,1,3,3)
+    Ix = th.conv2d(img_tensor, sobel_x, padding="same")
+    Iy = th.conv2d(img_tensor, sobel_y, padding="same")
+
+    Ixx = th.conv2d(Ix*Ix, G, stride=downsample)
+    Iyy = th.conv2d(Iy*Iy, G, stride=downsample)
+    Ixy = th.conv2d(Ix*Iy, G, stride=downsample)
+
+    tr = Ixx + Iyy
+    diff = Ixx - Iyy
+    enum = th.sqrt(diff**2 + 4 * Ixy**2 + 1e-8)
+    lambda2 = tr / 2 - enum / 2
+
+    # SIGNED eigenvector components
+    nx = Ixy.squeeze().numpy()
+    ny = (lambda2 - Ixx).squeeze().numpy()
+    norm = np.sqrt(nx**2 + ny**2 + 1e-8)
+    nx = nx / norm
+    ny = ny / norm
+
+    # resize back to native resolution
+    nx_up = cv.resize(nx, (nativeDimensions[1], nativeDimensions[0]), interpolation=cv.INTER_LINEAR)
+    ny_up = cv.resize(ny, (nativeDimensions[1], nativeDimensions[0]), interpolation=cv.INTER_LINEAR)
+
+    # renormalize after interpolation
+    norm = np.sqrt(nx_up**2 + ny_up**2 + 1e-8)
+    return nx_up / norm, ny_up / norm
 
 
 
@@ -214,16 +262,12 @@ def smart_structure_tensor_gpu(
     coarseGrainAverage="gaussian",
     coarseGrainingLength=4,
     downsample=2,
-    method="area",  # torch naming
+    method="bilinear",
     device="cuda",
 ):
     img_tensor = img_tensor.to(device).float()
-
     native_h, native_w = img_tensor.shape[2:]
 
-    # -------------------------
-    # Kernels
-    # -------------------------
     def get_gaussian_kernel(size, sigma=None):
         if sigma is None:
             sigma = size / 3
@@ -240,33 +284,14 @@ def smart_structure_tensor_gpu(
         G /= coarseGrainingLength**2
 
     G_small = get_gaussian_kernel(3)
-
-    # -------------------------
-    # Pre-smoothing
-    # -------------------------
     img_tensor = F.conv2d(img_tensor, G_small, padding="same")
 
-    # -------------------------
-    # Sobel gradients
-    # -------------------------
-    sobel_x = th.tensor(
-        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-        dtype=th.float32,
-        device=device
-    ).view(1, 1, 3, 3)
-
-    sobel_y = th.tensor(
-        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-        dtype=th.float32,
-        device=device
-    ).view(1, 1, 3, 3)
+    sobel_x = th.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=th.float32, device=device).view(1,1,3,3)
+    sobel_y = th.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=th.float32, device=device).view(1,1,3,3)
 
     Ix = F.conv2d(img_tensor, sobel_x, padding=1)
     Iy = F.conv2d(img_tensor, sobel_y, padding=1)
 
-    # -------------------------
-    # Structure tensor
-    # -------------------------
     Ixx = F.conv2d(Ix * Ix, G, stride=downsample)
     Iyy = F.conv2d(Iy * Iy, G, stride=downsample)
     Ixy = F.conv2d(Ix * Iy, G, stride=downsample)
@@ -274,104 +299,55 @@ def smart_structure_tensor_gpu(
     tr = Ixx + Iyy
     diff = Ixx - Iyy
     enum = th.sqrt(diff**2 + 4 * Ixy**2 + 1e-8)
-
     lambda2 = tr / 2 - enum / 2
 
-    # -------------------------
-    # Eigenvector (vectorized!)
-    # -------------------------
     nx = Ixy
     ny = lambda2 - Ixx
-
     norm = th.sqrt(nx**2 + ny**2 + 1e-8)
     nx = nx / norm
     ny = ny / norm
 
-    theta = th.acos(th.abs(nx).clamp(0, 1))
+    # resize signed components
+    mode = method
+    align = False if mode in ["bilinear", "bicubic"] else None
+    nx_up = F.interpolate(nx, size=(native_h, native_w), mode=mode, align_corners=align)
+    ny_up = F.interpolate(ny, size=(native_h, native_w), mode=mode, align_corners=align)
 
-    # -------------------------
-    # Resize on GPU
-    # -------------------------
-    theta = F.interpolate(
-        theta,
-        size=(native_h, native_w),
-        mode={
-            "area": "area",
-            "nearest": "nearest",
-            "bilinear": "bilinear",
-            "bicubic": "bicubic",
-        }[method],
-        align_corners=False if method in ["bilinear", "bicubic"] else None,
-    )
-
-    return theta  
+    # re-normalize after interpolation
+    norm = th.sqrt(nx_up**2 + ny_up**2 + 1e-8)
+    return nx_up / norm, ny_up / norm
 
 
 
 import torch as th
 import torch.nn.functional as F
 
-
-def get2DQTensor_gpu(theta, QtensorAverageScale, mum_per_px_2D):
-    """
-    theta: torch tensor [1,1,H,W] (radians)
-    returns: nx_cg, ny_cg, S  (all on GPU)
-    """
-
-    device = theta.device
-
-    # -------------------------
-    # Director field
-    # -------------------------
-    nx = th.cos(theta)
-    ny = th.sin(theta)
-
-    # -------------------------
-    # Q-tensor components
-    # -------------------------
+def get2DQTensor_gpu(nx, ny, QtensorAverageScale, mum_per_px_2D):
+    device = nx.device
+    
     Qxx = nx**2 - 0.5
     Qxy = nx * ny
 
-    # -------------------------
-    # Gaussian kernel
-    # -------------------------
     sigma = QtensorAverageScale / mum_per_px_2D
 
     def get_gaussian_kernel(sigma, device):
         size = int(6 * sigma + 1)
         if size % 2 == 0:
             size += 1
-
         ax = th.arange(-(size // 2), size // 2 + 1, device=device)
         xx, yy = th.meshgrid(ax, ax, indexing='ij')
-
         kernel = th.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         kernel = kernel / kernel.sum()
-
         return kernel.view(1, 1, size, size)
 
     G = get_gaussian_kernel(sigma, device)
-
-    # -------------------------
-    # Coarse graining (GPU conv)
-    # -------------------------
     Qxx_cg = F.conv2d(Qxx, G, padding="same")
     Qxy_cg = F.conv2d(Qxy, G, padding="same")
 
-    # -------------------------
-    # Order parameter
-    # -------------------------
     S = 2 * th.sqrt(Qxx_cg**2 + Qxy_cg**2 + 1e-8)
-
-    # -------------------------
-    # Normalize Q-tensor
-    # -------------------------
     Qxx_n = Qxx_cg / (S + 1e-8)
     Qxy_n = Qxy_cg / (S + 1e-8)
 
-    # -------------------------
-    # Back to director
-    # -------------------------
     nx_cg = th.sqrt((Qxx_n + 0.5).clamp(min=0))
     ny_cg = th.sqrt((1 - nx_cg**2).clamp(min=0)) * th.sign(Qxy_n)
 
@@ -827,7 +803,7 @@ def _to_conv_kernel(arr, device=None):
     return t
 
 
-def defect_analysis(radius, nx_cg, ny_cg, device=None):
+'''def defect_analysis(radius, nx_cg, ny_cg, device=None):
     """
     Topological defect detection via winding-number convolution.
 
@@ -886,9 +862,47 @@ def defect_analysis(radius, nx_cg, ny_cg, device=None):
     windingMap_clean[plus_defects] = +0.5
     windingMap_clean[minus_defects] = -0.5
 
-    return windingMap, windingMap_clean
+    return windingMap, windingMap_clean'''
 
+def defect_analysis(radius, nx_cg, ny_cg):
 
+    deltaX, deltaY, ring_kernel = make_ring_kernel(radius) 
+
+    # compute Q‐tensor
+    Qxx = nx_cg**2 - 0.5
+    Qxy = nx_cg * ny_cg
+
+    #  gradients
+    Qxx_y, Qxx_x = np.gradient(Qxx)
+    Qxy_y, Qxy_x = np.gradient(Qxy)
+
+    #  partial derivatives of θ
+    den = Qxx**2 + Qxy**2
+    dtheta_dx = 0.5 * (Qxx * Qxy_x - Qxy * Qxx_x) / den
+    dtheta_dy = 0.5 * (Qxx * Qxy_y - Qxy * Qxx_y) / den
+
+    # kill NaNs 
+    dtheta_dx = np.nan_to_num(dtheta_dx, nan=0.0)
+    dtheta_dy = np.nan_to_num(dtheta_dy, nan=0.0)
+
+    # ring kernels that apprxoimate the line integral of the winding number
+    deltaX, deltaY, ring_kernel = make_ring_kernel(4)
+
+    #  convolution -> winding map
+    windingMap = (
+        convolve2d(dtheta_dy, deltaY, mode='same') +
+        convolve2d(dtheta_dx, deltaX, mode='same')
+    ) / (2 * np.pi)
+
+    # find “point defects” by thinning the threshold‐masks
+    plus_defects  = thin(windingMap >  0.2)
+    minus_defects = thin(windingMap < -0.2)
+
+    windingMap_clean = np.zeros_like(windingMap, dtype=float)
+    windingMap_clean[plus_defects]  = +0.5
+    windingMap_clean[minus_defects] = -0.5
+
+    return(windingMap, windingMap_clean)
 
 """
 3-D disclination detection.
