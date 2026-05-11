@@ -98,6 +98,139 @@ def autocorr2d_fft(img):
     return corr / corr[center]
 
 
+# ── Fast strided replacement for get3DQTensor_gpu ────────────────────────────
+# The original runs 6 full-resolution 3D Gaussian convolutions (kernel up to
+# 51^3 elements) + 2 eigen-decompositions on the full volume. This replacement:
+#   1. Runs the 6 convolutions with stride DOWNSAMPLE_Q → much smaller output
+#   2. Trilinearly interpolates back to native resolution
+#   3. Runs eig only ONCE on the coarse grid, extracting the largest eigenvector
+#      directly (column 2 of eigh output) instead of calling eig twice.
+#
+# Rule of thumb for DOWNSAMPLE_Q: set it to roughly sigma/2 where
+# sigma = Q_SCALE_3D_UM / MUM_PER_PX_XY.  E.g. scale=5µm, px=0.5µm → sigma=10
+# → DOWNSAMPLE_Q = 4 or 5 is safe and gives ~64-125x fewer eig voxels.
+
+
+
+def _get3DQTensor_gpu_fast(vx, vy, vz, Q_average_scale, _DOWNSAMPLE_Q ,  mum_per_px, _EIG_CHUNK, device="cuda"):
+    """
+    Strided-GPU replacement for get3DQTensor_gpu.
+
+    Computes the 3-D nematic Q-tensor and scalar order parameter S by running
+    the six Gaussian coarse-graining convolutions on a subgrid (stride=_DOWNSAMPLE_Q)
+    and trilinearly interpolating back to native resolution. Eigenvector extraction
+    (largest eigenvector = director) is performed once on the coarse grid in chunks
+    of _EIG_CHUNK voxels to stay within cuSolver and VRAM limits.
+
+    Parameters
+    ----------
+    vx, vy, vz       : torch.Tensor [1,1,D,H,W]  Director field on device.
+    Q_average_scale  : float   Coarse-graining length [µm].
+    _DOWNSAMPLE_Q    : int     Convolution stride. Safe choice: sigma/2, where
+                               sigma = Q_average_scale / mum_per_px.
+    mum_per_px       : float   Lateral pixel size [µm/px].
+    _EIG_CHUNK       : int     Max voxels per eigh batch. Raise for speed,
+                               lower if cuSolver crashes (default 1_000_000).
+    device           : str     'cuda', 'cuda:0', or 'cpu'.
+
+    Returns
+    -------
+    nx_cg, ny_cg, nz_cg : torch.Tensor [1,1,D,H,W]  Coarse-grained director.
+    S                    : torch.Tensor [1,1,D,H,W]  Scalar order parameter [0,1].
+    """
+    vx = vx.to(device)
+    vy = vy.to(device)
+    vz = vz.to(device)
+
+    native_shape = vx.shape[2:]   # (D, H, W) before downsampling
+
+    # ── Q-tensor components (pointwise, full resolution, cheap) ────────────
+    Qxx = vx * vx - 1.0 / 3.0
+    Qyy = vy * vy - 1.0 / 3.0
+    Qzz = vz * vz - 1.0 / 3.0
+    Qxy = vx * vy
+    Qxz = vx * vz
+    Qyz = vy * vz
+
+    # ── Gaussian kernel ────────────────────────────────────────────────────
+    sigma = Q_average_scale / mum_per_px
+    G = _gaussian_kernel_3d_gpu(sigma, device)
+    pad = G.shape[-1] // 2
+    s   = _DOWNSAMPLE_Q
+
+    # ── Strided Gaussian CG (the expensive part, now on a coarse grid) ─────
+    Qxx_cg = F.conv3d(Qxx, G, stride=s, padding=pad)
+    Qyy_cg = F.conv3d(Qyy, G, stride=s, padding=pad)
+    Qzz_cg = F.conv3d(Qzz, G, stride=s, padding=pad)
+    Qxy_cg = F.conv3d(Qxy, G, stride=s, padding=pad)
+    Qxz_cg = F.conv3d(Qxz, G, stride=s, padding=pad)
+    Qyz_cg = F.conv3d(Qyz, G, stride=s, padding=pad)
+
+    del Qxx, Qyy, Qzz, Qxy, Qxz, Qyz
+    if "cuda" in device: th.cuda.empty_cache()
+
+    # ── Scalar order parameter S on coarse grid ────────────────────────────
+    QQ = (Qxx_cg**2 + Qyy_cg**2 + Qzz_cg**2
+          + 2*Qxy_cg**2 + 2*Qxz_cg**2 + 2*Qyz_cg**2)
+    S_coarse = th.sqrt(1.5 * QQ + 1e-8)
+
+    # ── Single eig call on coarse grid — largest eigenvector (column 2) ───
+    orig_shape = Qxx_cg.shape
+    N = Qxx_cg.numel()
+
+    M = th.zeros(N, 3, 3, device=device, dtype=th.float32)
+    for comp, (r, c) in zip(
+        [Qxx_cg.reshape(-1), Qyy_cg.reshape(-1), Qzz_cg.reshape(-1),
+         Qxy_cg.reshape(-1), Qxz_cg.reshape(-1), Qyz_cg.reshape(-1)],
+        [(0,0), (1,1), (2,2), (0,1), (0,2), (1,2)]
+    ):
+        M[:, r, c] = comp
+        if r != c:
+            M[:, c, r] = comp
+
+    nan_mask = ~th.isfinite(M).all(dim=-1).all(dim=-1)
+    M[nan_mask] = 0.0
+
+    all_vecs = th.empty(N, 3, 3, device=device, dtype=th.float32)
+    all_vals = th.empty(N, 3,    device=device, dtype=th.float32)
+    for start in range(0, N, _EIG_CHUNK):
+        end = min(start + _EIG_CHUNK, N)
+        v, e = th.linalg.eigh(M[start:end])
+        all_vals[start:end] = v
+        all_vecs[start:end] = e
+
+    # column 2 = largest eigenvalue → director
+    nx_coarse = all_vecs[:, 0, 2].reshape(orig_shape)
+    ny_coarse = all_vecs[:, 1, 2].reshape(orig_shape)
+    nz_coarse = all_vecs[:, 2, 2].reshape(orig_shape)
+
+    del M, all_vecs, all_vals
+    if "cuda" in device: th.cuda.empty_cache()
+
+    # ── Upsample all outputs back to native resolution ─────────────────────
+    interp = dict(size=native_shape, mode="trilinear", align_corners=False)
+    S        = F.interpolate(S_coarse,  **interp)
+    nx_cg    = F.interpolate(nx_coarse, **interp)
+    ny_cg    = F.interpolate(ny_coarse, **interp)
+    nz_cg    = F.interpolate(nz_coarse, **interp)
+
+    # re-normalise director after interpolation
+    norm = th.sqrt(nx_cg**2 + ny_cg**2 + nz_cg**2 + 1e-8)
+    nx_cg /= norm
+    ny_cg /= norm
+    nz_cg /= norm
+
+    # upsample Q components (already computed on coarse grid, reuse them)
+    Qxx_cg = F.interpolate(Qxx_cg, **interp)
+    Qyy_cg = F.interpolate(Qyy_cg, **interp)
+    Qzz_cg = F.interpolate(Qzz_cg, **interp)
+    Qxy_cg = F.interpolate(Qxy_cg, **interp)
+    Qxz_cg = F.interpolate(Qxz_cg, **interp)
+    Qyz_cg = F.interpolate(Qyz_cg, **interp)
+
+    return nx_cg, ny_cg, nz_cg, S, Qxx_cg, Qyy_cg, Qzz_cg, Qxy_cg, Qxz_cg, Qyz_cg
+
+
 def getGaussianKernel(coarseGrainingLength):
     """
     Returns a Gaussian kernel for coarse graining.
@@ -1180,6 +1313,94 @@ def zapotocky_plaquette_3d(dx, dy, dz):
     charges3D = xy_pierce.astype(np.float32) + yz_pierce.astype(np.float32) + zx_pierce.astype(np.float32)
 
     return charges3D, xy_pierce, yz_pierce, zx_pierce
+
+# ═══════════════════════════════════════════════════════════════════
+#  METHOD 3: Gradient magnitude thresholding + connected components + loose-end counting (Science 2020 methd)
+# ═══════════════════════════════════════════════════════════════════
+
+def _gradient_disclination_3d(nx, ny, nz, threshold=0.15, min_voxels=20):
+    """
+    Detect 3D disclination cores via |∇n| = sqrt( ∂ᵢnⱼ ∂ᵢnⱼ ) thresholding.
+
+    Computes the full Frobenius norm of the director gradient tensor —
+    9 terms: 3 spatial derivatives × 3 director components.
+    Thresholds to get a binary disclination mask, then labels connected
+    components and classifies each by topology using loose-end counting:
+      0 loose ends → closed loop   (genus = 1)
+      2 loose ends → open line
+     >2 loose ends → junction / branching
+
+    Parameters
+    ----------
+    nx, ny, nz   : float32 (D, H, W)   coarse-grained director components
+    threshold    : float   |∇n| value above which a voxel is flagged as disclination core
+    min_voxels   : int     discard components with fewer voxels than this
+
+    Returns
+    -------
+    charges3D  : float32 (D, H, W)   1 inside disclination cores, 0 elsewhere
+    loop_mask  : uint8   (D, H, W)   1 for voxels belonging to closed loops only
+    genus_map  : int32   (D, H, W)   loose-end count of the component each voxel belongs to
+    """
+    from scipy.ndimage import label, convolve
+
+    # ── |∇n|² = Σᵢ Σⱼ (∂ᵢnⱼ)²  ──────────────────────────────────────────────
+    print(f"  Computing |∇n| (9 gradient terms) ...")
+    grad_sq = np.zeros(nx.shape, dtype=np.float64)
+    for n_comp in [nx, ny, nz]:               # j = x, y, z
+        for axis in range(3):                 # i = 0 (z), 1 (y), 2 (x)
+            g = np.gradient(n_comp.astype(np.float64), axis=axis)
+            grad_sq += g * g
+    grad_mag = np.sqrt(grad_sq).astype(np.float32)
+    del grad_sq
+
+    # ── threshold ─────────────────────────────────────────────────────────────
+    disc_mask = grad_mag > threshold
+    print(f"  |∇n| > {threshold}: {int(disc_mask.sum())} voxels "
+          f"({100*disc_mask.mean():.2f}% of volume)")
+
+    # ── connected components (26-connectivity) ────────────────────────────────
+    struct = np.ones((3, 3, 3), dtype=np.int32)   # 26-connectivity
+    labeled, n_comp_total = label(disc_mask, structure=struct)
+    print(f"  Connected components before size filter: {n_comp_total}")
+
+    # ── loose-end detection ───────────────────────────────────────────────────
+    # A voxel is a loose end if it has exactly 1 neighbour within the mask.
+    kernel = np.ones((3, 3, 3), dtype=np.int32)
+    kernel[1, 1, 1] = 0
+    neighbor_count = convolve(disc_mask.astype(np.int32), kernel, mode='constant', cval=0)
+    loose_end_mask = disc_mask & (neighbor_count == 1)
+
+    # ── classify each component ───────────────────────────────────────────────
+    charges3D = np.zeros(nx.shape, dtype=np.float32)
+    loop_mask = np.zeros(nx.shape, dtype=np.uint8)
+    genus_map = np.zeros(nx.shape, dtype=np.int32)
+
+    n_loops = 0;  n_lines = 0;  n_junctions = 0;  n_small = 0
+    for comp_id in range(1, n_comp_total + 1):
+        comp_vox = labeled == comp_id
+        sz = int(comp_vox.sum())
+        if sz < min_voxels:
+            n_small += 1
+            continue
+
+        charges3D[comp_vox] = 1.0
+        n_loose = int(loose_end_mask[comp_vox].sum())
+        genus_map[comp_vox] = n_loose
+
+        if n_loose == 0:
+            loop_mask[comp_vox] = 1
+            n_loops += 1
+        elif n_loose == 2:
+            n_lines += 1
+        else:
+            n_junctions += 1
+
+    print(f"  Closed loops : {n_loops}")
+    print(f"  Open lines   : {n_lines}")
+    print(f"  Junctions    : {n_junctions}")
+    print(f"  Skipped      : {n_small} (< {min_voxels} voxels)")
+    return charges3D, loop_mask, genus_map
 
 
 # ═══════════════════════════════════════════════════════════════════

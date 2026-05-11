@@ -1,0 +1,22 @@
+conda deactivate
+conda env remove -n nematics3d -y
+
+conda create -n nematics3d python=3.11 -y
+conda activate nematics3d
+
+# VC++ runtime first, before anything else
+conda install -c conda-forge vs2015_runtime vc -y
+
+# Then pytorch via conda 
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia -y
+
+# Then the rest
+conda install numpy scipy scikit-image matplotlib tifffile -c conda-forge -y
+pip install opencv-python
+
+# Permanent OpenMP fix
+conda env config vars set KMP_DUPLICATE_LIB_OK=TRUE
+conda deactivate
+conda activate nematics3d
+
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0))"

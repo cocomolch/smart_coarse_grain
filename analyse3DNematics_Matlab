@@ -1,0 +1,39 @@
+
+
+dirTo3DNematics = 'C:\Users\pgotthe\Documents\WSINematics\tiles3D_Fibrosarkoma\Output\testSample_3d.mat'
+dirTo3DNematics_2D = 'C:\Users\pgotthe\Documents\WSINematics\tiles3D_Fibrosarkoma\Output\testSample_2d.mat'
+
+h5disp(dirTo3DNematics)
+
+h5disp(dirTo3DNematics_2D)
+
+
+charges = h5read(dirTo3DNematics, '/data/charges3D');
+
+S_3d = h5read(dirTo3DNematics, '/data/S_3d');
+isoSurfaces = S_3d < 0.51;
+margin = 20;  % adjust as needed
+
+function isoSurfaces =  deleteRim(isoSurfaces)
+    isoSurfaces(1:margin, :, :) = false;
+    isoSurfaces(end-margin+1:end, :, :) = false;
+    isoSurfaces(:, 1:margin, :) = false;
+    isoSurfaces(:, end-margin+1:end, :) = false;
+    isoSurfaces(:, :, 1:margin) = false;
+    isoSurfaces(:, :, end-margin+1:end) = false;
+end
+
+
+volshow(isoSurfaces)
+
+figure, histogram(charges)
+
+
+volshow(abs(charges) > 0.2 & abs(charges) < 0.6)
+
+
+sum(abs(charges) == 0, 'all')
+
+volshow (charges > 0)
+
+figure, histogram(charges(abs(charges) > 0.2 & charges(abs(charges) < 0.7 ))

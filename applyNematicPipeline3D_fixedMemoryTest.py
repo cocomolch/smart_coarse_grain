@@ -65,6 +65,7 @@ from structure_tensor_utils import (
     defect_analysis,
     _get3DQTensor_gpu_fast,
     zapotocky_plaquette_3d,
+    _gradient_disclination_3d
 )
 
 # ── NaN-safe, chunked replacement for _eig_symmetric_3x3 ─────────────────────
@@ -142,20 +143,20 @@ CFG = dict(
     # ── I/O ──────────────────────────────────────────────────────────────────
     
     #takes not the 3D tiles from director method, but load to fiji and then merge color channels and save as tiff
-    INPUT_TIFF        = r"C:\Users\pgotthe\Documents\WSINematics\tiles3D_Fibrosarkoma\tile_03_04\Merged.tif",   # multi-page TIFF (Z, Y, X)
-    OUTPUT_DIR        = r"C:\Users\pgotthe\Documents\WSINematics\tiles3D_Fibrosarkoma\tile_03_04",             # created automatically
-    EXPERIMENT_NAME   = "out_tile_x003_y004_winding_May3rd",                   # prefix for saved files
+    INPUT_TIFF        = r"C:\Users\pgotthe\Documents\WSINematics\tiles3D_Fibrosarkoma\tile_x002_y003_wQualityControl\Merged.tif",   # multi-page TIFF (Z, Y, X)
+    OUTPUT_DIR        = r"C:\Users\pgotthe\Documents\WSINematics\tiles3D_Fibrosarkoma\tile_x002_y003_wQualityControl",             # created automatically
+    EXPERIMENT_NAME   = "nematics3DResults_zapotockyMethod_06Thresh_structuretensor8mum_Qtensor20mum_May4th",                   # prefix for saved files
 
     # ── Physical calibration ─────────────────────────────────────────────────
     MUM_PER_PX_XY     = 2,    # lateral pixel size  [µm/px]
     MUM_PER_PX_Z      = 2,    # axial   pixel size  [µm/slice]
 
     # ── 3D structure tensor ───────────────────────────────────────────────────
-    CGL_3D_mum        = 5,     # coarse-graining kernel size [µm] — will be converted to voxels using MUM_PER_PX_XY
+    CGL_3D_mum        = 8,     # coarse-graining kernel size [µm] — will be converted to voxels using MUM_PER_PX_XY
     CG_METHOD_3D      = "gaussian",  # "gaussian" | "mean"
 
     # ── 3D Q-tensor coarse-graining ───────────────────────────────────────────
-    Q_SCALE_3D_UM     = 40,    # Gaussian σ for Q-tensor averaging [µm]
+    Q_SCALE_3D_UM     = 20,    # Gaussian σ for Q-tensor averaging [µm]
     EIG_CHUNK_3D = 1_000_000,   # chunk size GPU
 
 
@@ -163,22 +164,27 @@ CFG = dict(
     RING_RADIUS_3D    = 3,      # ring-kernel radius for winding-number [voxels]
     WINDING_THRESH    = 0.1,    # |winding| threshold to flag a defect voxel
     MIN_LINE_LENGTH   = 1,     # discard skeleton components shorter than this
-    DISC_DOWNSAMPLE = 2,
-    DISC_METHOD = "winding",  # "winding" | "zapotocky"
+    DISC_METHOD = "zapotocky",  # "winding" | "zapotocky" | "gradient"
+
+    GRAD_THRESH       = 0.6,   # |∇n| threshold for disclination core — tune between 0.05–0.4
+    GRAD_MIN_VOXELS   = 20,     # discard connected components smaller than this
     # ── 2D XY-slice analysis ──────────────────────────────────────────────────
-    CGL_2D            = 8,      # coarse-graining kernel size [pixels]
-    DOWNSAMPLE_2D     = 4,
-    Q_SCALE_2D_UM     = 40,    # Gaussian σ for 2D Q-tensor [µm]
-    RING_RADIUS_2D    = 7,      # winding-number ring kernel [pixels]
+    CGL_2D            = 4,      # coarse-graining kernel size [pixels]
+    DOWNSAMPLE_2D     = 2,
+    Q_SCALE_2D_UM     = 20,    # Gaussian σ for 2D Q-tensor [µm]
+    RING_RADIUS_2D    = 3,      # winding-number ring kernel [pixels]
     SLICE_STRIDE      = 1,      # 1 = every slice, N = every Nth slice
 
     # ── Hardware ──────────────────────────────────────────────────────────────
     DEVICE            = "cuda",  # "cuda" | "cuda:0" | "cpu"
 )
 
+
+
 CFG["CGL_3D"] = CFG["CGL_3D_mum"] / CFG["MUM_PER_PX_XY"]
-CFG["DOWNSAMPLE_3D"] = int(CFG["CGL_3D"] / 2) # structure tensor downsampling for speed (vs. resolution); typically half the CG kernel size
-CFG["DOWNSAMPLE_Q_3D"] = int((CFG["Q_SCALE_3D_UM"] / CFG["MUM_PER_PX_XY"]) / 2) # internal downsampling for Q-tensor CG (speed vs. resolution)
+CFG["DOWNSAMPLE_3D"] = int(CFG["CGL_3D"] / 1.5) # structure tensor downsampling for speed (vs. resolution); typically half the CG kernel size
+CFG["DOWNSAMPLE_Q_3D"] = int((CFG["Q_SCALE_3D_UM"] / CFG["MUM_PER_PX_XY"]) / 3) # internal downsampling for Q-tensor CG (speed vs. resolution)
+CFG["DISC_DOWNSAMPLE"] = int(CFG["Q_SCALE_3D_UM"] // CFG["MUM_PER_PX_XY"] // 2)   # downsample CG directors before disclination detection (speed vs. resolution)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  I/O helpers
@@ -313,30 +319,35 @@ def run_3d_pipeline(vol: np.ndarray, cfg: dict) -> dict:
         th.cuda.empty_cache()
 
     # ── 3D disclination detection ─────────────────────────────────────────────
-    # ── Downsample directors for memory-efficient disclination detection ──────────
-    # ── 3D disclination detection ─────────────────────────────────────────────
     print(f"\n── 3D disclination detection ({cfg['DISC_METHOD']}) ──────────────────")
     t0 = time.time()
 
-    if cfg["DISC_METHOD"] == "zapotocky":
-        # Zapotocky plaquette sign-flip — purely combinatorial, no gradients,
-        # no RAM explosion, runs directly on full-resolution CG directors.
-        # Returns binary pierce maps, not continuous winding values.
-        charges3D, winding_xy, winding_xz, winding_yz = _zapotocky_chunked(nx_cg, ny_cg, nz_cg,
-            slab_size = 10,   # increase if you have RAM headroom, decrease if still OOM
-    )
-        # zapotocky returns (charges, xy_pierce, yz_pierce, zx_pierce)
-        # remap to our naming convention (bool → float32)
-        winding_xy = winding_xy.astype(np.float32)
-        winding_xz = winding_xz.astype(np.float32)   # this is actually zx from zapotocky
-        winding_yz = winding_yz.astype(np.float32)
-        # build omega from pierce maps (same logic as winding method)
-        omega_raw_up = np.zeros((*nx_cg.shape, 3), dtype=np.float32)
-        omega_raw_up[winding_xy > 0, 2] = 1.0   # z-normal
-        omega_raw_up[winding_xz > 0, 1] = 1.0   # y-normal
-        omega_raw_up[winding_yz > 0, 0] = 1.0   # x-normal
+    # initialise outputs that not all methods fill
+    loop_mask = np.zeros(nx_cg.shape, dtype=np.uint8)
+    genus_map = np.zeros(nx_cg.shape, dtype=np.int32)
+    winding_xy   = np.zeros(nx_cg.shape, dtype=np.float32)
+    winding_xz   = np.zeros(nx_cg.shape, dtype=np.float32)
+    winding_yz   = np.zeros(nx_cg.shape, dtype=np.float32)
+    omega_raw_up = np.zeros((*nx_cg.shape, 3), dtype=np.float32)
 
-    else:  # "winding" — strided winding-number method
+    if cfg["DISC_METHOD"] == "gradient":
+        charges3D, loop_mask, genus_map = _gradient_disclination_3d(
+            nx_cg, ny_cg, nz_cg,
+            threshold  = cfg["GRAD_THRESH"],
+            min_voxels = cfg["GRAD_MIN_VOXELS"],
+        )
+
+    elif cfg["DISC_METHOD"] == "zapotocky":
+        charges3D, winding_xy, winding_xz, winding_yz = _zapotocky_chunked(
+            nx_cg, ny_cg, nz_cg, slab_size=10)
+        winding_xy   = np.asarray(winding_xy, dtype=np.float32)
+        winding_xz   = np.asarray(winding_xz, dtype=np.float32)
+        winding_yz   = np.asarray(winding_yz, dtype=np.float32)
+        omega_raw_up[winding_xy > 0, 2] = 1.0
+        omega_raw_up[winding_xz > 0, 1] = 1.0
+        omega_raw_up[winding_yz > 0, 0] = 1.0
+
+    else:  # "winding"
         ds = cfg["DISC_DOWNSAMPLE"]
         print(f"  Director shape: {nx_cg.shape}  →  downsampling by {ds}")
         if ds > 1:
@@ -347,7 +358,6 @@ def run_3d_pipeline(vol: np.ndarray, cfg: dict) -> dict:
             nx_disc = _ds3d(nx_cg);  ny_disc = _ds3d(ny_cg);  nz_disc = _ds3d(nz_cg)
         else:
             nx_disc, ny_disc, nz_disc = nx_cg, ny_cg, nz_cg
-
         print(f"  Disclination input shape: {nx_disc.shape}")
         charges3D_ds, winding_xy_ds, winding_xz_ds, winding_yz_ds, omega_raw = disclination_detection_3d(
             nx_disc, ny_disc, nz_disc,
@@ -368,31 +378,42 @@ def run_3d_pipeline(vol: np.ndarray, cfg: dict) -> dict:
             winding_yz = _us3d(winding_yz_ds)
             omega_raw_up = np.stack([_us3d(omega_raw[..., i]) for i in range(3)], axis=-1)
         else:
-            charges3D, winding_xy, winding_xz, winding_yz = charges3D_ds, winding_xy_ds, winding_xz_ds, winding_yz_ds
+            charges3D  = charges3D_ds
+            winding_xy = winding_xy_ds
+            winding_xz = winding_xz_ds
+            winding_yz = winding_yz_ds
             omega_raw_up = omega_raw
 
-    n_defect_vox = int((np.abs(charges3D) > cfg["WINDING_THRESH"]).sum())
+    n_defect_vox = int((charges3D > 0).sum())
     print(f"  Done in {time.time()-t0:.1f}s  |  defect voxels: {n_defect_vox}")
+    # Use np.asarray instead of .astype to avoid copying arrays that are
+    # already float32 — each .astype() on a (150,2048,2048) float32 array
+    # allocates an extra 2.34 GiB even when no conversion is needed.
+    def _f32(a):
+        return np.asarray(a, dtype=np.float32)
+
     return dict(
         # raw structure tensor
-        vx=vx.astype(np.float32),
-        vy=vy.astype(np.float32),
-        vz=vz.astype(np.float32),
-        #theta_3d=theta_3d.astype(np.float32),
-        #phi_3d=phi_3d.astype(np.float32),
+        vx=_f32(vx),
+        vy=_f32(vy),
+        vz=_f32(vz),
+        #theta_3d=_f32(theta_3d),
+        #phi_3d=_f32(phi_3d),
         # Q-tensor CG
-        nx_cg=nx_cg.astype(np.float32),
-        ny_cg=ny_cg.astype(np.float32),
-        nz_cg=nz_cg.astype(np.float32),
-        S_3d=S_3d.astype(np.float32),
+        nx_cg=_f32(nx_cg),
+        ny_cg=_f32(ny_cg),
+        nz_cg=_f32(nz_cg),
+        S_3d=_f32(S_3d),
         # disclination
-        charges3D=charges3D.astype(np.float32),
-        winding_xy=winding_xy.astype(np.float32),
-        winding_xz=winding_xz.astype(np.float32),
-        winding_yz=winding_yz.astype(np.float32),
-        omega_3d=omega_raw_up.astype(np.float32),
-        #beta_3d=beta_3d.astype(np.float32),
-        #skel_3d=skel_3d.astype(np.uint8),  # bool → uint8 for MATLAB compat
+        charges3D=_f32(charges3D),
+        winding_xy=_f32(winding_xy),
+        winding_xz=_f32(winding_xz),
+        winding_yz=_f32(winding_yz),
+        omega_3d=_f32(omega_raw_up),
+        loop_mask  = np.asarray(loop_mask, dtype=np.uint8),
+        genus_map  = np.asarray(genus_map, dtype=np.int32),
+        #beta_3d=_f32(beta_3d),
+        #skel_3d=np.asarray(skel_3d, dtype=np.uint8),
     )
 
 
